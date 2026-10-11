@@ -1,0 +1,11 @@
+# Watches, prompts, query images and state live in
+# /extra/malmasik/vinted_assistant_data, never here: this repo is public.
+data/
+watches/
+*.jpg
+*.jpeg
+*.png
+*.webp
+__pycache__/
+*.pyc
+.env

@@ -1,0 +1,42 @@
+name: poll
+
+# Fetches each requested watch's Vinted filter page and hands the listings back
+# as an artifact. Triggered only by the cluster (workflow_dispatch) - GitHub's
+# own scheduler creates just 4-6 runs a day whatever cron it is given, which
+# would make a 15-minute cadence impossible.
+#
+# This repository is public. Filter URLs come from the WATCH_FILTERS secret and
+# watches are referred to by opaque ids, so neither the code, the inputs nor the
+# logs reveal what is being searched for.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ids:
+        description: 'comma-separated opaque watch ids; empty = all'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install --quiet requests
+      - name: Poll
+        env:
+          WATCH_FILTERS: ${{ secrets.WATCH_FILTERS }}
+          WATCH_IDS: ${{ inputs.ids }}
+        run: python -m assistant.poll
+      - uses: actions/upload-artifact@v4
+        with:
+          name: results
+          path: results.json
+          # The cluster downloads this within minutes; nothing needs it after.
+          retention-days: 1
