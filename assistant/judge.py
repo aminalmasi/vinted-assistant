@@ -106,24 +106,28 @@ def _cand_blocks(cands: list[dict]) -> list:
 
 
 MODES = """\
-exact mode: I want one specific shoe. Match only the same model and \
-colourway; a different model from the same brand is a no, however close.
-similar mode: I want things in the spirit of my reference photos. Judge how \
-well each listing fits the style, shape and details I describe, leaning on my \
+My written request defines what counts. The reference photos show what I \
+mean; where they and my text differ, my text wins.
+exact mode: I am hunting one specific shoe. It must be the same model as my \
+references. If my text names a colourway, material or detail, that must match \
+too; if it does not, judge by the model and treat colourway as a preference.
+similar mode: I want things in the spirit of my references. Judge how well \
+each listing fits the style, shape and details I describe, leaning on my \
 favourite photo and on what I said I like most."""
 
 SCREEN_SYS = f"""\
-You pre-screen second-hand shoe listings on Vinted for one buyer. You see the \
-buyer's request and reference photos, then a batch of listings, each with one \
-photo. Keep any listing that plausibly fits, and drop the clearly unrelated - \
-a stricter judge reviews whatever you keep, so when unsure, keep it.
+You pre-screen second-hand shoe listings on Vinted for one buyer, and a \
+stronger judge reviews everything you keep. Your only job is to drop listings \
+that are plainly the wrong shoe: a different model, a different kind of shoe, \
+or not a shoe at all. Do NOT judge colourway, condition, finish or size - leave \
+those to the next judge. When unsure, keep it.
 {MODES}
 Answer only through the JSON schema, one verdict per listing."""
 
 FINAL_SYS = f"""\
 You decide whether a second-hand shoe listing on Vinted is worth alerting one \
 buyer about. Each alert interrupts them on their phone, so alert only when the \
-listing genuinely fits what they asked for; a near miss is not an alert.
+listing genuinely fits what they asked for.
 {MODES}
 For each listing, write a headline of at most 12 words saying what it is and \
 why it fits, and a one-sentence reason. Answer only through the JSON schema."""

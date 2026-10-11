@@ -154,7 +154,7 @@ def query_embedding(w: dict):
     return emb
 
 
-def stage_one(w: dict, cands: list[dict]) -> list[dict]:
+def stage_one(w: dict, cands: list[dict], first: bool = False) -> list[dict]:
     from assistant.embed import embed, scores
     q = query_embedding(w)
     fav = w["images"].index(w["favourite"]) if w["favourite"] in w["images"] else None
@@ -163,27 +163,38 @@ def stage_one(w: dict, cands: list[dict]) -> list[dict]:
         c["s1"] = round(float(x), 4)
     keep = [c for c in cands if c["s1"] >= C.FLOOR[w["mode"]]]
     keep.sort(key=lambda c: -c["s1"])
-    return keep[:C.MAX_SCREEN]
+    return keep[:C.FIRST_SCREEN_MAX if first else C.MAX_SCREEN]
 
 
 def run_judge(fn, model: str, w: dict, cands: list[dict], stats: dict, key: str):
+    from concurrent.futures import ThreadPoolExecutor
+    chunks = [cands[i:i + C.CHUNK] for i in range(0, len(cands), C.CHUNK)]
     verdicts = {}
-    for i in range(0, len(cands), C.CHUNK):
-        chunk = cands[i:i + C.CHUNK]
-        v, meta = fn(model, w, chunk)
-        verdicts.update(v)
-        stats[f"{key}_quota_usd"] = round(stats.get(f"{key}_quota_usd", 0)
-                                          + (meta.get("quota_usd") or 0), 4)
-        stats[f"{key}_calls"] = stats.get(f"{key}_calls", 0) + 1
-        if meta.get("error"):
-            print(f"    {key} call error: {meta['error'][:160]}", flush=True)
-        missing = [c["id"] for c in chunk if c["id"] not in v]
-        if missing:
-            print(f"    {key}: no verdict for {len(missing)} listing(s)", flush=True)
+    with ThreadPoolExecutor(max_workers=C.JUDGE_PARALLEL) as pool:
+        # A QuotaExhausted from any chunk propagates out of .result() and stops
+        # the cascade, so the whole batch is queued rather than half-judged.
+        for chunk, (v, meta) in zip(chunks, pool.map(lambda ch: fn(model, w, ch), chunks)):
+            verdicts.update(v)
+            stats[f"{key}_quota_usd"] = round(stats.get(f"{key}_quota_usd", 0)
+                                              + (meta.get("quota_usd") or 0), 4)
+            stats[f"{key}_calls"] = stats.get(f"{key}_calls", 0) + 1
+            if meta.get("error"):
+                print(f"    {key} call error: {meta['error'][:160]}", flush=True)
+            missing = [c["id"] for c in chunk if c["id"] not in v]
+            if missing:
+                print(f"    {key}: no verdict for {len(missing)} listing(s)", flush=True)
     return verdicts
 
 
-def process(w: dict, ws: dict, cands: list[dict], dry: bool) -> dict:
+def log_verdicts(w: dict, rows: list[dict]) -> None:
+    """Every listing's path through the cascade, so rejections can be audited."""
+    with open(os.path.join(C.LOGS, "verdicts.jsonl"), "a") as fh:
+        for r in rows:
+            fh.write(json.dumps({"at": int(time.time()), "watch": w["name"], **r}) + "\n")
+
+
+def process(w: dict, ws: dict, cands: list[dict], dry: bool,
+            first: bool = False) -> dict:
     stats = {"new": len(cands)}
     with_photo = []
     for c in cands:
@@ -194,16 +205,32 @@ def process(w: dict, ws: dict, cands: list[dict], dry: bool) -> dict:
     if not with_photo:
         return stats
 
-    s1 = stage_one(w, with_photo)
+    s1 = stage_one(w, with_photo, first)
     stats["stage1"] = len(s1)
+    s1_ids = {c["id"] for c in s1}
+    floor = C.FLOOR[w["mode"]]
+    # Floor and cap are logged apart on purpose: the first test lost ~50 valid
+    # listings to the cap, and calling those "below the floor" would have hidden it.
+    trail = {c["id"]: {"id": c["id"], "title": c["title"], "price": c.get("price"),
+                       "url": c["url"], "s1": c.get("s1"),
+                       "stage": "stage1" if c["id"] in s1_ids else
+                                ("dropped_floor" if (c.get("s1") or 0) < floor
+                                 else "dropped_cap")}
+             for c in with_photo}
     if not s1:
+        log_verdicts(w, list(trail.values()))
         return stats
 
     try:
         sv = run_judge(judge.screen, C.SCREEN_MODEL, w, s1, stats, "screen")
+        for c in s1:
+            v = sv.get(c["id"], {})
+            trail[c["id"]].update(stage="screened_out" if not v.get("keep") else "screened_in",
+                                  screen_score=v.get("score"), screen_reason=v.get("reason"))
         s2 = [c for c in s1 if sv.get(c["id"], {}).get("keep")]
         stats["stage2"] = len(s2)
         if not s2:
+            log_verdicts(w, list(trail.values()))
             return stats
         fv = run_judge(judge.final, C.FINAL_MODEL, w, s2, stats, "final")
     except judge.QuotaExhausted as exc:
@@ -213,16 +240,34 @@ def process(w: dict, ws: dict, cands: list[dict], dry: bool) -> dict:
                                              "url", "path")} for c in s1]
         stats["deferred"] = len(s1)
         stats["quota_exhausted"] = str(exc)[:120]
+        log_verdicts(w, [dict(t, stage="deferred_quota") for t in trail.values()])
         return stats
 
-    alerts = 0
+    bar = w["min_score"] if w["min_score"] is not None else (C.MIN_SCORE[w["mode"]] or 0.0)
+    hits = []
     for c in s2:
-        v = fv.get(c["id"])
-        if v and v.get("alert") and c["id"] not in ws["alerted"]:
+        v = fv.get(c["id"]) or {}
+        passes = bool(v.get("alert")) and (v.get("score") or 0) >= bar
+        trail[c["id"]].update(final_score=v.get("score"), final_alert=v.get("alert"),
+                              headline=v.get("headline"), final_reason=v.get("reason"),
+                              stage="alerted" if passes else
+                              ("below_min_score" if v.get("alert") else "final_rejected"))
+        if passes and c["id"] not in ws["alerted"]:
+            hits.append((c, v))
+
+    alerts = 0
+    if hits and (first or len(hits) > C.DIGEST_OVER):
+        why = "already listed" if first else "new this tick"
+        if notify.digest(w, hits, why, dry=dry):
+            alerts = len(hits)
+    else:
+        for c, v in hits:
             if notify.send(w, c, v, dry=dry):
                 alerts += 1
-                ws["alerted"] = (ws["alerted"] + [c["id"]])[-500:]
+    if alerts:
+        ws["alerted"] = (ws["alerted"] + [c["id"] for c, _ in hits])[-500:]
     stats["alerts"] = alerts
+    log_verdicts(w, list(trail.values()))
     return stats
 
 
@@ -277,7 +322,7 @@ def main() -> int:
         ws["seen"] = (ws["seen"] + [l["id"] for l in listings
                                     if l["id"] not in seen])[-C.SEEN_KEEP:]
         queued, ws["pending"] = ws.get("pending", []), []
-        stats = process(w, ws, queued + new, a.dry_run)
+        stats = process(w, ws, queued + new, a.dry_run, first=first)
         stats["listings"] = len(listings)
         stats["first_poll"] = first
         ws["last_poll"] = now
