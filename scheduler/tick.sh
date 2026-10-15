@@ -24,6 +24,9 @@ mkdir -p "$DATA/logs"
 export PATH="/home/malmasik/.local/bin:/extra/malmasik/.local/bin:$PATH"
 # CPU only: SigLIP2 is fast enough here, and this must never take a GPU
 export CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=4 VA_THREADS=4
+# Off the shared /tmp, which other users fill to 97%+; Claude itself gets this
+# from ~/.claude/settings.json, this covers the Python side of the tick.
+export TMPDIR=/extra/malmasik/tmp
 
 cd "$REPO_DIR" || exit 1
 exec flock -n "$DATA/tick.lock" \
