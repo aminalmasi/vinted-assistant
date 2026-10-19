@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import collections
 import json
+import os
 import re
 import sys
 import time
@@ -38,6 +39,8 @@ BRANDS = {
     "Bottega Veneta": ["bottegaveneta", "bottega"],
 }
 GAP = 5.0
+# Probe a subset: VA_BRANDS="Dior,Golden Goose"
+ONLY = [b.strip() for b in os.environ.get("VA_BRANDS", "").split(",") if b.strip()]
 CARD_RE = re.compile(r'"url":"/items/(\d{6,12})-([a-z0-9-]{1,80})".{0,4000}?"firstLine":"([^"]{1,60})"', re.S)
 
 
@@ -73,6 +76,8 @@ def main() -> int:
     s = session()
     out = {}
     for brand, keys in BRANDS.items():
+        if ONLY and brand not in ONLY:
+            continue
         print(f"{brand}:", flush=True)
         html = get(s, "https://www.vinted.it/catalog", search_text=brand, order="newest_first")
         cs = cards(html)
@@ -81,10 +86,15 @@ def main() -> int:
         print(f"  {len(cs)} cards, brand titles: {dict(names.most_common(8))}")
         found = []
         for name in variants:
-            iid, slug = next((i, sl) for i, sl, b in cs if b == name)
-            page = get(s, f"https://www.vinted.it/items/{iid}-{slug}")
-            m = (re.search(r'\\?"brand_id\\?":\\?"?(\d+)', page)
-                 or re.search(r'/brand/(\d+)-[a-z0-9-]+', page))
+            # Up to three listings per variant: the first may have been
+            # deleted since the search (a 404 lost Dior and Golden Goose).
+            m = None
+            for iid, slug in [(i, sl) for i, sl, b in cs if b == name][:3]:
+                page = get(s, f"https://www.vinted.it/items/{iid}-{slug}")
+                m = (re.search(r'\\?"brand_id\\?":\\?"?(\d+)', page)
+                     or re.search(r'/brand/(\d+)-[a-z0-9-]+', page))
+                if m:
+                    break
             if not m:
                 print(f"  {name!r}: no brand id on its listing page")
                 continue
@@ -94,7 +104,8 @@ def main() -> int:
             share = got[name] / max(1, sum(got.values()))
             found.append({"title": name, "id": bid, "listings": total(check),
                           "share_on_id_search": round(share, 2), "seen_in_search": names[name]})
-            print(f"  {name!r}: id {bid}, {total(check)} listings, {share:.0%} of an id search is this title")
+            print(f"  {name!r}: id {bid}, {total(check)} listings, {share:.0%} of an id search is this title;"
+                  f" the id search returns {dict(got.most_common(4))}")
         out[brand] = found
     json.dump(out, open("brands.json", "w"), indent=1, ensure_ascii=False)
     print("wrote brands.json")
