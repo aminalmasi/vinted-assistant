@@ -15,6 +15,7 @@ Writes taxonomy.json (Vinted's own public category list) as the artifact.
 
 from __future__ import annotations
 
+import gzip
 import json
 import re
 import sys
@@ -38,45 +39,28 @@ def flight(html: str) -> str:
     return "".join(out)
 
 
-def balanced(text: str, start: int) -> str | None:
-    """The JSON array or object beginning at text[start], brackets matched."""
-    open_ch = text[start]
-    close_ch = {"[": "]", "{": "}"}[open_ch]
-    depth, i, in_str, esc = 0, start, False, False
-    while i < len(text):
-        ch = text[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-        elif ch == '"':
-            in_str = True
-        elif ch == open_ch:
-            depth += 1
-        elif ch == close_ch:
-            depth -= 1
-            if depth == 0:
-                return text[start:i + 1]
-        i += 1
-    return None
-
-
 def find_tree(data: str) -> list | None:
-    """The largest parseable `catalogs` array - the full tree, not a submenu."""
-    best = None
+    """The largest `catalogs` array - the full tree, not a submenu.
+
+    Every node of the tree has its own nested `catalogs` array, so a match
+    lying inside one already decoded is skipped; decoding each of them afresh
+    rescans the whole tree per node, which is how the first version of this
+    probe ran for twenty minutes.
+    """
+    dec = json.JSONDecoder()
+    best, covered_to = None, -1
     for m in re.finditer(r'"catalogs":\[', data):
-        blob = balanced(data, m.end() - 1)
-        if not blob or (best and len(blob) <= len(best)):
+        start = m.end() - 1
+        if start < covered_to:
             continue
         try:
-            json.loads(blob)
-            best = blob
+            obj, end = dec.raw_decode(data, start)
         except ValueError:
-            pass
-    return json.loads(best) if best else None
+            continue
+        covered_to = end
+        if best is None or len(obj) > len(best):
+            best = obj
+    return best
 
 
 def flatten(nodes: list, path: list, out: list) -> None:
@@ -111,7 +95,10 @@ def main() -> int:
     html = s.get("https://www.vinted.it/catalog", params={"search_text": "gucci"},
                  timeout=60).text
     data = flight(html)
-    print(f"page {len(html)//1024} KB -> {len(data)//1024} KB decoded payload")
+    print(f"page {len(html)//1024} KB -> {len(data)//1024} KB decoded payload", flush=True)
+    # Kept so the parsing can be iterated on offline instead of re-requesting.
+    with gzip.open("payload.txt.gz", "wt") as fh:
+        fh.write(data)
     tree = find_tree(data)
     if not tree:
         print("could not locate the catalogs tree")
