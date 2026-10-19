@@ -18,4 +18,4 @@ jobs:
           retention-days: 3
           path: |
             taxonomy.json
-            payload.txt.gz
+            *.txt.gz

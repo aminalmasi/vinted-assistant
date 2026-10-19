@@ -23,8 +23,6 @@ import time
 
 from assistant.vinted import session
 
-BRANDS = ["Gucci", "Chanel", "Hermes", "Christian Louboutin", "Dior", "Prada",
-          "Saint Laurent", "Valentino", "Golden Goose", "Bottega Veneta"]
 PUSH_RE = re.compile(r'self\.__next_f\.push\(\[1,("(?:[^"\\]|\\.)*")\]\)')
 
 
@@ -64,30 +62,31 @@ def find_tree(data: str) -> list | None:
 
 
 def flatten(nodes: list, path: list, out: list) -> None:
+    """Keep every scalar field: the page lists the tree flat, so a node's
+    place in it (parent id or similar) is in fields, not in nesting."""
     for n in nodes:
         here = path + [n.get("title", "?")]
         kids = n.get("catalogs") or []
-        out.append({"id": n.get("id"), "code": n.get("code"), "title": n.get("title"),
-                    "path": " > ".join(here), "depth": len(here),
-                    "leaf": not kids, "url": n.get("url")})
+        rec = {k: v for k, v in n.items() if not isinstance(v, (list, dict))}
+        rec.update(path=" > ".join(here), depth=len(here), leaf=not kids,
+                   keys=sorted(n))
+        out.append(rec)
         flatten(kids, here, out)
 
 
-def brand_id(s, name: str) -> dict:
-    """Read the brand id off a real listing whose brand field is this brand."""
+def brand_probe(s, name: str) -> None:
+    """Save two listing pages' decoded payloads; the brand-id pattern is then
+    worked out offline instead of guessed at the cost of 60 requests."""
     r = s.get("https://www.vinted.it/catalog",
               params={"search_text": name, "order": "relevance"}, timeout=60)
-    for iid, slug in re.findall(r"/items/(\d{6,12})-([a-z0-9-]{3,80})", r.text)[:6]:
+    with gzip.open("catalog_brand.txt.gz", "wt") as fh:
+        fh.write(flight(r.text) or r.text)
+    for n, (iid, slug) in enumerate(re.findall(r"/items/(\d{6,12})-([a-z0-9-]{3,80})", r.text)[:2]):
         time.sleep(5)
         page = s.get(f"https://www.vinted.it/items/{iid}-{slug}", timeout=60).text
-        m = re.search(r'\\?"brand_id\\?":(\d+)', page)
-        t = re.search(r'\\?"url\\?":\\?"/brand/(\d+)-([a-z0-9-]+)\\?"', page)
-        if m and t and t.group(1) == m.group(1):
-            want = re.sub(r"[^a-z]", "", name.lower())
-            got = re.sub(r"[^a-z]", "", t.group(2))
-            if want in got or got in want:
-                return {"brand": name, "id": int(m.group(1)), "slug": t.group(2)}
-    return {"brand": name, "id": None, "slug": None}
+        with gzip.open(f"item{n}.txt.gz", "wt") as fh:
+            fh.write(page)
+        print(f"  item {n}: {len(page)//1024} KB, 'brand' occurs {page.count('brand')}x", flush=True)
 
 
 def main() -> int:
@@ -107,17 +106,12 @@ def main() -> int:
     flatten(tree, [], flat)
     print(f"tree: {len(tree)} roots, {len(flat)} categories, "
           f"{sum(f['leaf'] for f in flat)} leaves")
-    for f in flat:
-        if f["depth"] <= 2:
-            print(f"  {f['id']:>6}  {f['code'] or '':<28} {f['path']}")
+    print(f"node keys: {flat[0]['keys']}")
 
-    brands = []
-    for b in BRANDS:
-        time.sleep(5)
-        brands.append(brand_id(s, b))
-        print(f"  brand {brands[-1]}", flush=True)
+    time.sleep(5)
+    brand_probe(s, "Gucci")
 
-    json.dump({"tree": flat, "brands": brands}, open("taxonomy.json", "w"), indent=1)
+    json.dump({"tree": flat}, open("taxonomy.json", "w"), indent=1)
     print("wrote taxonomy.json")
     return 0
 
