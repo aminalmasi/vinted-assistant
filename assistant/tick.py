@@ -1,14 +1,22 @@
 """One tick on the cluster: poll due watches via Actions, then judge locally.
 
     1. sync each watch's filter URL into the repo's WATCH_FILTERS secret
-    2. dispatch the poll workflow and wait for it            (~1-2 min)
+    2. dispatch the poll workflow (sealed request) and wait     ~1-2 min
+       - it reads each NEW listing's own page too: every photo, the
+         description, the claimed condition, the seller's record
     3. keep only listings never handled before for that watch
-    4. SigLIP2 floor on CPU                                  free
-    5. screen batch on your plan (Haiku)                     ~$0.003 quota / listing
-    6. final batch on your plan (Opus)
-    7. Telegram the alerts
+    4. filter check against the listing's page                  free
+    5. SigLIP2 floor on CPU                                     free
+    6. screen batch on your plan (Haiku), main photo only       ~$0.003 quota / listing
+    7. final batch on your plan (Opus), every photo: matches the filter,
+       condition honesty, authenticity risk, seller record
+    8. Telegram the alerts
 
-Run from cron every 15 minutes via scheduler/tick.sh, which holds a lock so a
+A listing that passes 4-6 without its page (a first poll's backlog, or a
+burst of uploads past the per-poll cap) waits for the page, which the next
+poll fetches on request; only screen survivors cost a page request at all.
+
+Run from cron every 5 minutes via scheduler/tick.sh, which holds a lock so a
 slow tick is skipped rather than stacked.
 """
 
@@ -29,7 +37,8 @@ import requests
 from PIL import Image
 
 from assistant import config as C
-from assistant import judge, notify
+from assistant import filtercheck, judge, notify, priceref
+from assistant.seal import seal, unseal
 from assistant.watches import load as load_watches
 
 STATE_FILE = os.path.join(C.STATE, "state.json")
@@ -52,8 +61,20 @@ def save_state(st: dict) -> None:
 
 
 def wstate(st: dict, wid: str) -> dict:
-    return st["watches"].setdefault(wid, {"seen": [], "pending": [], "last_poll": 0,
-                                          "stats": {}, "alerted": []})
+    ws = st["watches"].setdefault(wid, {"seen": [], "pending": [], "last_poll": 0,
+                                        "stats": {}, "alerted": []})
+    ws.setdefault("await", {})      # id -> card, screened in, waiting for its page
+    ws.setdefault("max_id", None)   # highest id handled: the poll reads pages above it
+    return ws
+
+
+# What is kept of a listing between ticks.
+CARD_KEYS = ("id", "slug", "title", "price", "photo", "url", "likes", "brand", "line2",
+             "promoted", "page", "path")
+
+
+def keep(c: dict) -> dict:
+    return {k: c[k] for k in CARD_KEYS if k in c}
 
 
 # ----------------------------------------------------------------- github
@@ -80,10 +101,10 @@ def sync_filters(watches: list[dict], st: dict) -> None:
     print(f"  filters secret updated ({len(watches)} watch(es))", flush=True)
 
 
-def poll(ids: list[str]) -> dict:
-    """Dispatch the poll workflow, wait for it, return results.json."""
+def poll(req: dict) -> dict:
+    """Dispatch the poll workflow, wait for it, return its unsealed results."""
     t0 = time.time()
-    gh("workflow", "run", C.WORKFLOW, "-R", C.REPO, "-f", "ids=" + ",".join(ids))
+    gh("workflow", "run", C.WORKFLOW, "-R", C.REPO, "-f", "req=" + seal(req))
     run_id = None
     for _ in range(30):                       # find the run we just started
         time.sleep(4)
@@ -111,22 +132,19 @@ def poll(ids: list[str]) -> dict:
         raise RuntimeError(f"poll run {run_id} did not finish in time")
     with tempfile.TemporaryDirectory() as d:
         gh("run", "download", str(run_id), "-R", C.REPO, "-n", "results", "-D", d)
-        return json.load(open(os.path.join(d, "results.json")))
+        return unseal(open(os.path.join(d, "results.enc")).read())
 
 
 # ----------------------------------------------------------------- photos
 
-def fetch_photo(wid: str, c: dict) -> str | None:
-    """Local JPEG copy of a listing's catalog photo (Vinted's CDN, not Vinted)."""
-    folder = os.path.join(C.CACHE, wid)
-    os.makedirs(folder, exist_ok=True)
-    path = os.path.join(folder, f"{c['id']}.jpg")
+def _download(url: str | None, path: str) -> str | None:
+    """Local JPEG copy of one photo (Vinted's CDN, not Vinted itself)."""
     if os.path.exists(path):
         return path
-    if not c.get("photo"):
+    if not url:
         return None
     try:
-        r = requests.get(c["photo"], timeout=30,
+        r = requests.get(url, timeout=30,
                          headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.vinted.it/"})
         if r.status_code != 200 or not r.content:
             return None
@@ -135,6 +153,22 @@ def fetch_photo(wid: str, c: dict) -> str | None:
         return path
     except (requests.RequestException, OSError):
         return None
+
+
+def fetch_photo(wid: str, c: dict) -> str | None:
+    """The catalog photo, which screening uses."""
+    folder = os.path.join(C.CACHE, wid)
+    os.makedirs(folder, exist_ok=True)
+    return _download(c.get("photo"), os.path.join(folder, f"{c['id']}.jpg"))
+
+
+def fetch_photos(wid: str, c: dict) -> list[str]:
+    """Every photo on the listing's page, for the final judge."""
+    folder = os.path.join(C.CACHE, wid)
+    os.makedirs(folder, exist_ok=True)
+    urls = ((c.get("page") or {}).get("photos") or [])[:C.MAX_PHOTOS]
+    paths = [_download(u, os.path.join(folder, f"{c['id']}_{i}.jpg")) for i, u in enumerate(urls)]
+    return [p for p in paths if p]
 
 
 # ---------------------------------------------------------------- cascade
@@ -166,9 +200,10 @@ def stage_one(w: dict, cands: list[dict], first: bool = False) -> list[dict]:
     return keep[:C.FIRST_SCREEN_MAX if first else C.MAX_SCREEN]
 
 
-def run_judge(fn, model: str, w: dict, cands: list[dict], stats: dict, key: str):
+def run_judge(fn, model: str, w: dict, cands: list[dict], stats: dict, key: str,
+              chunk: int = C.CHUNK):
     from concurrent.futures import ThreadPoolExecutor
-    chunks = [cands[i:i + C.CHUNK] for i in range(0, len(cands), C.CHUNK)]
+    chunks = [cands[i:i + chunk] for i in range(0, len(cands), chunk)]
     verdicts = {}
     with ThreadPoolExecutor(max_workers=C.JUDGE_PARALLEL) as pool:
         # A QuotaExhausted from any chunk propagates out of .result() and stops
@@ -193,65 +228,104 @@ def log_verdicts(w: dict, rows: list[dict]) -> None:
             fh.write(json.dumps({"at": int(time.time()), "watch": w["name"], **r}) + "\n")
 
 
-def process(w: dict, ws: dict, cands: list[dict], dry: bool,
+def process(w: dict, ws: dict, cands: list[dict], resumed: list[dict], dry: bool,
             first: bool = False) -> dict:
-    stats = {"new": len(cands)}
+    """cands: listings new this tick, some with their page attached.
+    resumed: listings that passed screening earlier and whose page has now
+    arrived - they go straight to the final judge."""
+    stats = {"new": len(cands), "resumed": len(resumed)}
+    f = filtercheck.parse(w["filter"])
+    w = dict(w, filter_words=filtercheck.describe(f))
+    trail: dict[str, dict] = {}
+
+    def note(c, stage, **kw):
+        trail.setdefault(c["id"], {"id": c["id"], "title": c["title"], "price": c.get("price"),
+                                   "url": c["url"]}).update(stage=stage, **kw)
+
+    def conforms(c) -> bool:
+        if not c.get("page"):
+            return True
+        bad = filtercheck.violations(f, c, c["page"])
+        if bad:
+            note(c, "filter_mismatch", why=bad)
+            return False
+        c["flags"] = filtercheck.soft_flags(f, c["page"])
+        return True
+
+    n0 = len(cands) + len(resumed)
+    cands, resumed = [c for c in cands if conforms(c)], [c for c in resumed if conforms(c)]
+    stats["filter_mismatch"] = n0 - len(cands) - len(resumed)
+
     with_photo = []
     for c in cands:
         c["path"] = c.get("path") or fetch_photo(w["id"], c)
         if c["path"]:
             with_photo.append(c)
     stats["with_photo"] = len(with_photo)
-    if not with_photo:
-        return stats
-
-    s1 = stage_one(w, with_photo, first)
+    s1 = stage_one(w, with_photo, first) if with_photo else []
     stats["stage1"] = len(s1)
     s1_ids = {c["id"] for c in s1}
     floor = C.FLOOR[w["mode"]]
     # Floor and cap are logged apart on purpose: the first test lost ~50 valid
     # listings to the cap, and calling those "below the floor" would have hidden it.
-    trail = {c["id"]: {"id": c["id"], "title": c["title"], "price": c.get("price"),
-                       "url": c["url"], "s1": c.get("s1"),
-                       "stage": "stage1" if c["id"] in s1_ids else
-                                ("dropped_floor" if (c.get("s1") or 0) < floor
-                                 else "dropped_cap")}
-             for c in with_photo}
-    if not s1:
-        log_verdicts(w, list(trail.values()))
-        return stats
+    for c in with_photo:
+        if c["id"] not in s1_ids:
+            note(c, "dropped_floor" if (c.get("s1") or 0) < floor else "dropped_cap", s1=c.get("s1"))
 
     try:
-        sv = run_judge(judge.screen, C.SCREEN_MODEL, w, s1, stats, "screen")
-        for c in s1:
-            v = sv.get(c["id"], {})
-            trail[c["id"]].update(stage="screened_out" if not v.get("keep") else "screened_in",
-                                  screen_score=v.get("score"), screen_reason=v.get("reason"))
-        s2 = [c for c in s1 if sv.get(c["id"], {}).get("keep")]
+        s2 = []
+        if s1:
+            sv = run_judge(judge.screen, C.SCREEN_MODEL, w, s1, stats, "screen")
+            for c in s1:
+                v = sv.get(c["id"], {})
+                note(c, "screened_in" if v.get("keep") else "screened_out", s1=c.get("s1"),
+                     screen_score=v.get("score"), screen_reason=v.get("reason"))
+            s2 = [c for c in s1 if sv.get(c["id"], {}).get("keep")]
         stats["stage2"] = len(s2)
-        if not s2:
-            log_verdicts(w, list(trail.values()))
-            return stats
-        fv = run_judge(judge.final, C.FINAL_MODEL, w, s2, stats, "final")
+        # No page yet: wait for one rather than judge condition from a thumbnail.
+        for c in s2:
+            if not c.get("page"):
+                ws["await"][c["id"]] = dict(keep(c), asks=0)
+                note(c, "awaiting_page")
+        ready = [c for c in s2 if c.get("page")] + resumed
+        stats["final_in"] = len(ready)
+        for c in ready:
+            c["path"] = c.get("path") or fetch_photo(w["id"], c)
+            c["paths"] = fetch_photos(w["id"], c)
+            pg = c.get("page") or {}
+            c["price_ref"] = priceref.lookup(pg.get("brand_id"), pg.get("catalog_id"))
+        ready = [c for c in ready if c.get("path") or c.get("paths")]
+        fv = run_judge(judge.final, C.FINAL_MODEL, w, ready, stats, "final",
+                       chunk=C.FINAL_CHUNK) if ready else {}
     except judge.QuotaExhausted as exc:
         # Queue rather than drop: these listings were never actually judged,
         # and treating "out of quota" as "no match" would silently lose them.
-        ws["pending"] = [{k: c[k] for k in ("id", "slug", "title", "price", "photo",
-                                             "url", "path")} for c in s1]
-        stats["deferred"] = len(s1)
+        ws["pending"] = [keep(c) for c in s1 + resumed]
+        stats["deferred"] = len(s1) + len(resumed)
         stats["quota_exhausted"] = str(exc)[:120]
         log_verdicts(w, [dict(t, stage="deferred_quota") for t in trail.values()])
         return stats
 
     bar = w["min_score"] if w["min_score"] is not None else (C.MIN_SCORE[w["mode"]] or 0.0)
     hits = []
-    for c in s2:
+    for c in ready:
         v = fv.get(c["id"]) or {}
-        passes = bool(v.get("alert")) and (v.get("score") or 0) >= bar
-        trail[c["id"]].update(final_score=v.get("score"), final_alert=v.get("alert"),
-                              headline=v.get("headline"), final_reason=v.get("reason"),
-                              stage="alerted" if passes else
-                              ("below_min_score" if v.get("alert") else "final_rejected"))
+        # The judge's own alert decision, with its four checks enforced as well:
+        # a listing it calls a match despite a turn-off defect or a high fake
+        # risk is still held back.
+        held = [why for ok, why in ((v.get("matches", True), "does not match"),
+                                    (not v.get("turn_off"), "turn-off defect"),
+                                    (v.get("fake_risk") != "high", "high fake risk"))
+                if not ok]
+        passes = bool(v.get("alert")) and (v.get("score") or 0) >= bar and not held
+        note(c, "alerted" if passes else ("held_back" if v.get("alert") else "final_rejected"),
+             final_score=v.get("score"), final_alert=v.get("alert"), held=held or None,
+             headline=v.get("headline"), final_reason=v.get("reason"),
+             condition_claimed=(c.get("page") or {}).get("condition"),
+             condition_seen=v.get("condition_seen"), defects=v.get("defects"),
+             photo_gaps=v.get("photo_gaps"), fake_risk=v.get("fake_risk"),
+             fake_cues=v.get("fake_cues"), seller_risk=v.get("seller_risk"),
+             price_ref=c.get("price_ref"))
         if passes and c["id"] not in ws["alerted"]:
             hits.append((c, v))
 
@@ -297,11 +371,20 @@ def main() -> int:
         return 0
     print(f"{dt.datetime.now():%H:%M} {len(due)} watch(es) due", flush=True)
 
+    req = {"ids": [w["id"] for w in due], "since": {}, "detail": {}}
+    for w in due:
+        ws = wstate(st, w["id"])
+        if ws["max_id"]:
+            req["since"][w["id"]] = ws["max_id"]
+        asked = [[i, c["url"]] for i, c in ws["await"].items()
+                 if c["asks"] < C.PAGE_ASKS][:C.PAGE_ASK_MAX]
+        if asked:
+            req["detail"][w["id"]] = asked
     if a.results:
         results = json.load(open(a.results))
     else:
         sync_filters(watches, st)
-        results = poll([w["id"] for w in due])
+        results = poll(req)
 
     log = {"at": int(now), "watches": {}}
     for w in due:
@@ -313,16 +396,32 @@ def main() -> int:
                   f" - retrying next tick", flush=True)
             log["watches"][w["name"]] = {"poll": r.get("status") if r else None}
             continue
-        listings = r["listings"]
+        listings, pages = r["listings"], r.get("details") or {}
         seen = set(ws["seen"])
         first = not ws["seen"]
         new = [l for l in listings if l["id"] not in seen]
         if first and not C.BACKFILL:
             new = []
+        for c in new:
+            if c["id"] in pages:
+                c["page"] = pages[c["id"]]
         ws["seen"] = (ws["seen"] + [l["id"] for l in listings
                                     if l["id"] not in seen])[-C.SEEN_KEEP:]
+        organic = [int(l["id"]) for l in listings if not l.get("promoted")]
+        if organic:
+            ws["max_id"] = max(organic + ([ws["max_id"]] if ws["max_id"] else []))
+        # Awaited listings: resume the ones whose page came back; after
+        # PAGE_ASKS failed requests, judge from the thumbnail with that noted.
+        resumed = []
+        for i, c in list(ws["await"].items()):
+            if i in pages:
+                resumed.append(dict(ws["await"].pop(i), page=pages[i]))
+            elif [i, c["url"]] in req["detail"].get(w["id"], []):
+                c["asks"] += 1
+                if c["asks"] >= C.PAGE_ASKS:
+                    resumed.append(ws["await"].pop(i))
         queued, ws["pending"] = ws.get("pending", []), []
-        stats = process(w, ws, queued + new, a.dry_run, first=first)
+        stats = process(w, ws, queued + new, resumed, a.dry_run, first=first)
         stats["listings"] = len(listings)
         stats["first_poll"] = first
         ws["last_poll"] = now

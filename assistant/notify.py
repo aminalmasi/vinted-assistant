@@ -45,14 +45,32 @@ def _creds() -> tuple[str | None, list[str]]:
     return token, chats
 
 
+GRADE = {"new_tags": "new with tags", "new": "new", "very_good": "very good",
+         "good": "good", "satisfactory": "satisfactory", "cannot_tell": "can't tell"}
+
+
 def caption(w: dict, c: dict, v: dict) -> str:
     e = html.escape
+    pg = c.get("page") or {}
     price = f"EUR {c['price']:.0f}" if c.get("price") else "price ?"
     tag = "🎯" if w["mode"] == "exact" else "✨"
     lines = [f"{tag} <b>{e(v.get('headline') or c['title'])}</b>",
-             f"{e(price)} · match {v.get('score', 0):.2f} · {e(w['name'])}",
-             e(v.get("reason", "")),
-             f'<a href="{e(c["url"])}">open on Vinted</a>']
+             f"{e(price)} · match {v.get('score', 0):.2f} · {e(w['name'])}"]
+    if c.get("price_ref"):
+        lines.append(f"typical: {e(c['price_ref'])}")
+    if v.get("condition_seen"):
+        claimed = pg.get("condition") or "?"
+        lines.append(f"condition: seller says <i>{e(claimed)}</i>, photos show "
+                     f"<b>{e(GRADE.get(v['condition_seen'], v['condition_seen']))}</b>")
+    if v.get("defects"):
+        lines.append("defects: " + e("; ".join(v["defects"][:3])))
+    if v.get("photo_gaps"):
+        lines.append("not shown: " + e(v["photo_gaps"][:120]))
+    if v.get("fake_risk"):
+        seller = f"{pg['seller_reviews']} reviews" if pg.get("seller_reviews") is not None else "seller ?"
+        lines.append(f"fake risk {e(v['fake_risk'])} · {e(seller)}"
+                     + (f" · {pg['likes']} likes" if pg.get("likes") is not None else ""))
+    lines += [e(v.get("reason", "")), f'<a href="{e(c["url"])}">open on Vinted</a>']
     return "\n".join(lines)[:1024]
 
 

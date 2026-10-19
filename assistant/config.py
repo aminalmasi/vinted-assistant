@@ -60,6 +60,18 @@ SEEN_KEEP = 4000           # per-watch memory of listing ids already handled
 
 IMG_SIDE = 768             # photos are downscaled before being sent to a judge
 
+# The final judge sees every photo on a listing's page (condition and
+# authenticity live in the details a single thumbnail hides), so its batches
+# are smaller: 4 listings x up to 8 photos per call.
+MAX_PHOTOS = 8
+FINAL_CHUNK = 4
+
+# A listing that passed screening on its thumbnail waits for its page. The poll
+# reads up to PAGE_ASK_MAX of those per run; one whose page still has not come
+# back after PAGE_ASKS polls is judged from the thumbnail, with that noted.
+PAGE_ASKS = 3
+PAGE_ASK_MAX = 15
+
 # More alerts than this in one tick arrive as a single ranked digest instead of
 # separate messages; a watch's first poll always does.
 DIGEST_OVER = 5

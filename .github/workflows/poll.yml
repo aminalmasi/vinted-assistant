@@ -5,15 +5,16 @@ name: poll
 # own scheduler creates just 4-6 runs a day whatever cron it is given, which
 # would make a 15-minute cadence impossible.
 #
-# This repository is public. Filter URLs come from the WATCH_FILTERS secret and
-# watches are referred to by opaque ids, so neither the code, the inputs nor the
-# logs reveal what is being searched for.
+# This repository is public, and so are its run logs, inputs and artifacts.
+# Filter URLs come from the WATCH_FILTERS secret; what to poll arrives sealed
+# in the `req` input and the results leave sealed, both with the WATCH_KEY
+# secret (assistant/seal.py). Nothing readable here says what is being hunted.
 
 on:
   workflow_dispatch:
     inputs:
-      ids:
-        description: 'comma-separated opaque watch ids; empty = all'
+      req:
+        description: 'sealed request (assistant/seal.py); empty = poll all watches'
         required: false
         default: ''
 
@@ -23,7 +24,7 @@ permissions:
 jobs:
   poll:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -32,11 +33,12 @@ jobs:
       - name: Poll
         env:
           WATCH_FILTERS: ${{ secrets.WATCH_FILTERS }}
-          WATCH_IDS: ${{ inputs.ids }}
+          WATCH_REQ: ${{ inputs.req }}
+          VA_KEY: ${{ secrets.WATCH_KEY }}
         run: python -m assistant.poll
       - uses: actions/upload-artifact@v4
         with:
           name: results
-          path: results.json
+          path: results.enc
           # The cluster downloads this within minutes; nothing needs it after.
           retention-days: 1

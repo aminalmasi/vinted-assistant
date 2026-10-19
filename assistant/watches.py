@@ -12,7 +12,7 @@
     images: [q1.jpg, q2.jpg]
     favourite: q1.jpg      # optional - in similar mode, weighted most
     notes: I like the worn, distressed finish most   # optional
-    every_min: 15          # optional, default 15
+    every_min: 5           # optional, default 5
     min_score: 0.85        # optional - alert only above this final-judge score
     active: true           # optional, default true
 """
@@ -69,7 +69,7 @@ def load() -> list[dict]:
             "notes": str(w.get("notes", "")).strip(),
             "images": imgs,
             "favourite": os.path.join(folder, fav) if fav else None,
-            "every_min": int(w.get("every_min", 15)),
+            "every_min": int(w.get("every_min", 5)),
             "min_score": float(w["min_score"]) if w.get("min_score") is not None else None,
             "active": bool(w.get("active", True)),
         })
