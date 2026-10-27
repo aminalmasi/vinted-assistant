@@ -1,0 +1,82 @@
+{
+ "Gucci": [
+  {
+   "id": 567,
+   "title": "Gucci"
+  }
+ ],
+ "Chanel": [
+  {
+   "id": 481,
+   "title": "Chanel"
+  }
+ ],
+ "Hermes": [
+  {
+   "id": 4785,
+   "title": "Hermès"
+  }
+ ],
+ "Christian Louboutin": [
+  {
+   "id": 4269,
+   "title": "Christian Louboutin"
+  }
+ ],
+ "Dior": [
+  {
+   "id": 671,
+   "title": "Dior"
+  },
+  {
+   "id": 15430438,
+   "title": "Christian Dior"
+  },
+  {
+   "id": 168598,
+   "title": "Baby Dior"
+  }
+ ],
+ "Prada": [
+  {
+   "id": 3573,
+   "title": "Prada"
+  }
+ ],
+ "Saint Laurent": [
+  {
+   "id": 377,
+   "title": "Yves Saint Laurent"
+  },
+  {
+   "id": 83122,
+   "title": "Saint Laurent"
+  }
+ ],
+ "Valentino": [
+  {
+   "id": 15450529,
+   "title": "Valentino Garavani"
+  }
+ ],
+ "Golden Goose": [
+  {
+   "id": 38923,
+   "title": "Golden Goose"
+  },
+  {
+   "id": 401372,
+   "title": "Ggdb"
+  },
+  {
+   "id": 14340650,
+   "title": "golden_goose"
+  }
+ ],
+ "Bottega Veneta": [
+  {
+   "id": 86972,
+   "title": "Bottega Veneta"
+  }
+ ]
+}

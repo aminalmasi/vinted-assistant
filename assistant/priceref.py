@@ -24,17 +24,23 @@ BRANDS = os.path.join(os.path.dirname(__file__), "ref", "brands.json")
 
 @functools.cache
 def _table() -> dict[tuple[str, int], dict]:
-    days = sorted(glob.glob(os.path.join(PRICES, "*")))
+    # Only each brand's NEWEST walk counts, whole. Merging rows across walks
+    # would keep a category the newer walk no longer has: the first Valentino
+    # walk searched the plain "Valentino" id too (mostly cheap bags), and its
+    # rows must not survive under the Garavani-only one.
+    latest: dict[str, tuple[int, dict]] = {}
+    for f in glob.glob(os.path.join(PRICES, "*", "*.json")):
+        try:
+            d = json.load(open(f))
+        except (OSError, ValueError):
+            continue
+        if d.get("brand") and d.get("at", 0) >= latest.get(d["brand"], (0, {}))[0]:
+            latest[d["brand"]] = (d.get("at", 0), d)
     rows: dict[tuple[str, int], dict] = {}
-    for day in days:                       # newer days overwrite older ones
-        for f in glob.glob(os.path.join(day, "*.json")):
-            try:
-                d = json.load(open(f))
-            except (OSError, ValueError):
-                continue
-            for r in d.get("rows", []):
-                if r.get("asking"):
-                    rows[(d["brand"], int(r["catalog_id"]))] = r
+    for brand, (_, d) in latest.items():
+        for r in d.get("rows", []):
+            if r.get("asking"):
+                rows[(brand, int(r["catalog_id"]))] = r
     return rows
 
 
